@@ -1,8 +1,12 @@
 # pieces put together from 
 # https://medium.com/wearesinch/building-aes-128-from-the-ground-up-with-python-8122af44ebf9
 
-# Performs AES-ECB encryption in 2PC (with 10 rounds of communication) on parties' 
-# XOR shares of key schedule and the message 
+# At the start of the protocol parties have their XOR shares of AES round key
+# and their XOR shares of the message.
+# At the end, they will have their XOR shares of the ciphertext
+
+# Bandwidth complexity: 40 KB
+# Round complexity: 0.5 rounds (1 message from Master to Slave)
 
 import random
 
@@ -231,13 +235,9 @@ def xor_grids(a,b):
 
 
 # Same as the original enc except at the SubBytes step
-# - waits for the other party's share of the state
-# - combines the shares of the state into the full AES state
-# - performs S-box substitution
-# - splits the new state into random XOR shares and sends the slave's share to him
+# - gets his new AES state from the masked LUT sent by master
 # - continues the normal AES flow
-def enc_master(expanded_key, data):
-
+def enc_slave(expanded_key, data):
     # First we need to padd the data with \x00 and break it into blocks of 16
     pad = bytes(16 - len(data) % 16)
     
@@ -263,23 +263,14 @@ def enc_master(expanded_key, data):
         temp_grids = []
         
         for grid in grids:
-            # wait for slave's share of the state
-            slave_state = s2mq.get()
-            # combine into full state
-            full_state = []
-            for x in range(0,4):
-                tmp = []
-                for y in range(0,4):
-                    tmp.append(slave_state[x][y]^grid[x][y])
-                full_state.append(tmp)
-            # perform S-box
-            sub_bytes_step = [[lookup(val) for val in row] for row in full_state]
-            # break up the new state into XOR shares
-            my_state_share = get_random_state()
-            his_state_share = xor_grids(sub_bytes_step, my_state_share)
-            # send the slave his share
-            m2sq.put(his_state_share)
-            # continue with our share
+            # get new AES state share from a LUT from Master
+            luts = luts_for_all_rounds.pop(0)
+            # TODO: not implemented. In production we need to check that each
+            # LUT contains exactly 256 non-repeating entries from 0 to 255. Otherwise
+            # the Master can doctor those LUTs and learn some biases 
+            my_state_share = lookup_in_masked_lut(grid, luts)
+            #continue normal AES flow
+            
             shift_rows_step = [rotate_row_left(
                 my_state_share[i], i) for i in range(4)]
             mix_column_step = mix_columns(shift_rows_step)
@@ -294,23 +285,10 @@ def enc_master(expanded_key, data):
     round_key = extract_key_for_round(expanded_key, 10)
 
     for grid in grids:
-        # wait for slave's share of the state
-        slave_state = s2mq.get()
-        # combine into full state
-        full_state = []
-        for x in range(0,4):
-            tmp = []
-            for y in range(0,4):
-                tmp.append(slave_state[x][y]^grid[x][y])
-            full_state.append(tmp)
-        # perform S-box
-        sub_bytes_step = [[lookup(val) for val in row] for row in full_state]
-        # break up the new state into XOR shares
-        my_state_share = get_random_state()
-        his_state_share = xor_grids(sub_bytes_step, my_state_share)
-        # send the slave his share
-        m2sq.put(his_state_share)
-        # continue with our share
+        # get new AES state share from a LUT from Master
+        luts = luts_for_all_rounds.pop(0)
+        my_state_share = lookup_in_masked_lut(grid, luts)
+        #continue normal AES flow
 
         shift_rows_step = [rotate_row_left(
             my_state_share[i], i) for i in range(4)]
@@ -331,11 +309,9 @@ def enc_master(expanded_key, data):
 
 
 # Same as the original enc except at the SubBytes stage
-# - sends his share of the state to the master
-# - receives his new share from the master
+# - compute a masked LUT for the slave and our new AES state share
 # - continues the normal AES flow
-def enc_slave(expanded_key, data):
-
+def enc_master(expanded_key, data):
     # First we need to padd the data with \x00 and break it into blocks of 16
     pad = bytes(16 - len(data) % 16)
     
@@ -361,12 +337,10 @@ def enc_slave(expanded_key, data):
         temp_grids = []
         
         for grid in grids:
-            
-            # send master our share of the state
-            s2mq.put(grid)
-            # receive new share of the state and continue
-            my_state_share = m2sq.get()
-         
+            # prepare LUTs for the slave and our new state
+            his_luts, my_state_share = prepare_lut_share(grid)
+            luts_for_all_rounds.append(his_luts)
+            #continue normal AES flow
             shift_rows_step = [rotate_row_left(
                 my_state_share[i], i) for i in range(4)]
             mix_column_step = mix_columns(shift_rows_step)
@@ -381,11 +355,10 @@ def enc_slave(expanded_key, data):
     round_key = extract_key_for_round(expanded_key, 10)
 
     for grid in grids:
-        # send master our share of the state
-        s2mq.put(grid)
-        # receive new share of the state and continue
-        my_state_share = m2sq.get()
-        
+        # prepare LUTs for the slave and our nestate
+        his_luts, my_state_share = prepare_lut_share(grid)
+        luts_for_all_rounds.append(his_luts)
+        #continue normal AES flow
         shift_rows_step = [rotate_row_left(
             my_state_share[i], i) for i in range(4)]
         add_sub_key_step = add_sub_key(shift_rows_step, round_key)
@@ -393,7 +366,7 @@ def enc_slave(expanded_key, data):
 
     grids = temp_grids
 
-    # Just need to recriate the data into a single stream before returning
+    # Just need to recreate the data into a single stream before returning
     int_stream = []
     
     for grid in grids:
@@ -403,18 +376,67 @@ def enc_slave(expanded_key, data):
 
     return bytes(int_stream)
 
+# For every byte of our AES state share we prepare a masked lookup table
+# such that the other party byte is the key and the looked up value becomes 
+# its new AES state share.
+# For each byte's masked LUT, we apply the same mask.
+# 
+# The algorithm above is run for every byte (for a total of 16 bytes) of the
+# AES state. The masks become our new AES state  
 
-from queue import Queue
-from threading import Thread
-# slave-to-master and master-to-slave queues
-s2mq = Queue(maxsize = 300)
-m2sq = Queue(maxsize = 300)
-# master's output will go here
-master_output = None
+# my_keys are my XOR shares of the AES state which serve as the keys of the LUT
+def prepare_lut_share(my_keys):
+    my_new_state = []
+    # all 16 masked LUTs will go here
+    his_luts = []
 
-def master_thread(key_schedule_share, msg_share):
-    global master_output
-    master_output = enc_master(key_schedule_share, msg_share)
+    for row in my_keys:
+        # his luts for one row of the AES state
+        his_luts_row = []
+        my_new_state_row = []
+
+        for byte in row:
+            # for each byte construct a masked LUT for the other party 
+
+            # imagine that the other party's key share is 0, 1, ... 255
+            # construct the lookup table for the other party so they could
+            # lookup the correct value. Then mask that value. Masks become
+            # out new AES state shares
+            his_lut = []
+            mask = random.randint(0, 255)
+            my_new_state_row.append(mask)
+
+            for x in range(0, 256):
+                looked_up_value = lookup(byte ^ x)
+                his_lut.append(looked_up_value ^ mask)
+            his_luts_row.append(his_lut)
+        his_luts.append(his_luts_row)
+        my_new_state.append(my_new_state_row)
+
+    return his_luts, my_new_state
+
+
+# for every byte in out state, look up a value and make it
+# our new state. The index of the value in the LUT is the key
+# by which we perform the lookup
+def lookup_in_masked_lut(my_state, lut):
+    new_state = []
+
+    for i, row in enumerate(lut):
+        new_state_row = []
+        for j, col in enumerate(row):
+            # lookup a value using our key as the index of the array
+            looked_up_val = col[my_state[i][j]]
+            new_state_row.append(looked_up_val)
+        new_state.append(new_state_row)
+    
+    return new_state
+
+
+
+
+# master's LUTs will go here
+luts_for_all_rounds = []
 
 if __name__ == "__main__":
     # random AES key and random message
@@ -443,12 +465,11 @@ if __name__ == "__main__":
     # compute normal AES
     expected = enc(key_sched, msg)
 
-    # start aes2pc master and slave with shares of key schedule and shares of the message
-    thread = Thread(target = master_thread, args = (master_key_sched_share, master_msg_share, ))
-    thread.start()
+    # Compute master's output. The LUTs which must be passed to slave are put
+    # into the global var luts_for_all_rounds
+    master_output = enc_master(master_key_sched_share, master_msg_share)
     slave_output = enc_slave(slave_key_sched_share, slave_msg_share)
-    # master's output will be in global var master_output
-    thread.join()
+
     aes2pc_output = hex(int.from_bytes(master_output, 'big') ^ int.from_bytes(slave_output, 'big'))
 
     if '0x'+expected.hex() == aes2pc_output:
